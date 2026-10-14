@@ -44,6 +44,10 @@ A key enters a machine's trust store **only from that machine's own terminal**:
    `sha256("sessionpipe.pair:" + machine + ":" + code)`.
 3. The daemon polls `GET {control}/pair?code=…` until it answers `paired` with the key
    and that assertion ([`control-paired.json`](https://sessionpipe.org/schema/v1/control-paired.json)).
+   A code the receiver expires unapproved MAY be renewed from the same terminal: a new
+   `POST {control}/pair` naming the `machine` it was handed (so the receiver keeps
+   one row), new digits printed, for as long as the command runs. The expired code
+   answers nothing; no code lives longer than the receiver gave it.
    The daemon MUST verify the assertion against the key it was handed before it trusts
    the key. A receiver that swaps in another key cannot produce the proof.
 4. The first pairing of a machine also hands over the machine's own bearer `token`,
@@ -67,6 +71,15 @@ The pairing request and every hello MAY carry the machine's allowed `folders` an
 `mode` (`safe`: nothing that needs approval runs unattended; `auto`: the harness's auto
 mode), so a receiver can offer a folder picker for a new session. They are
 informational: the machine checks its own list again (§5 step 6).
+
+They MAY also carry `accounts`: the harness accounts signed in on the machine, each
+`{harness, id, email}`, where `id` is what events carry as `session.account_id` and
+`email` is the address the account signs in with, so the receiver's board can name an
+account rather than show its id. The email travels only here, to a receiver the
+person paired with, and never on an event (events reach every sink, a team board
+included). The daemon reads the accounts again for every hello, so a new sign-in is
+named without pairing again. A receiver MUST NOT treat them as anything but a label:
+nothing on the machine is checked against them.
 
 Keys are listed and removed one at a time on the machine (`sessionpipe control keys`,
 `sessionpipe control keys remove <id>`); `sessionpipe control off` removes the machine,

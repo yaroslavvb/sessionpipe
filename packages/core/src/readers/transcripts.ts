@@ -3,6 +3,7 @@
 // said before the next one), each with the line it ends on, and the line the
 // cursor may advance to once every turn is delivered. Ported from spacesheep-cli
 // lib/memory.js. One reader per harness file format; nothing else is vendor code.
+import { codexReplayBoundary } from "../adapters/codex-rollout.js";
 import type { TranscriptRead } from "../adapters/types.js";
 
 interface Msg {
@@ -34,7 +35,12 @@ export function pairTurns(msgs: Msg[], endLine: number): TranscriptRead {
   if (cur?.assistant) turns.push(cur);
   // A user message with no reply yet stays unsent: the cursor stops before it.
   const line = cur && !cur.assistant ? cur.startLine : endLine;
-  return { turns: turns.map((t) => ({ user: t.user, assistant: t.assistant, at: t.at, endLine: t.endLine })), line };
+  const out: TranscriptRead = {
+    turns: turns.map((t) => ({ user: t.user, assistant: t.assistant, at: t.at, endLine: t.endLine })),
+    line,
+  };
+  if (cur && !cur.assistant && cur.user) out.open = { user: cur.user, at: cur.at };
+  return out;
 }
 
 /** Injected context the person never typed: <tag>…</tag> wrappers, HTML comments, slash-command expansions. */
@@ -96,7 +102,12 @@ export function codexInjected(text: string): boolean {
 /** Codex rollout: {type:"response_item", payload:{type:"message", role, content:[{type:"input_text"|"output_text", text}]}}. */
 export function readCodex(lines: string[], from: number): TranscriptRead {
   const msgs: Msg[] = [];
-  for (let i = from; i < lines.length; i++) {
+  const boundary = codexReplayBoundary(parse(lines.find((line) => line.trim()) ?? ""));
+  // Find the boundary from the header even when resuming inside the replay.
+  // Keep absolute line numbers: the delivery cursor refers to the original file.
+  const start = boundary ? lines.findIndex((line) => boundary(parse(line))) : 0;
+  if (start < 0) return pairTurns(msgs, endOf(lines));
+  for (let i = Math.max(from, start); i < lines.length; i++) {
     const j = lines[i] ? parse(lines[i] as string) : null;
     if (!j || j.type !== "response_item") continue;
     const p = j.payload as { type?: string; role?: string; content?: unknown } | undefined;

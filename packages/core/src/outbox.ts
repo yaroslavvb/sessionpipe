@@ -26,6 +26,9 @@ export interface OutboxRef {
   session: string;
 }
 
+const READ_CHUNK = 1024 * 1024;
+const READ_MAX = 8 * 1024 * 1024;
+
 export class Outbox {
   constructor(readonly root: string) {}
 
@@ -97,7 +100,11 @@ export class Outbox {
   }
 
   /** Read events after byte offset `from`; returns them and the new offset. Lines
-   *  are read whole; a partial trailing line (a write in progress) is left. */
+   *  are read whole; a partial trailing line (a write in progress) is left. A read
+   *  takes READ_CHUNK bytes at a time, not the rest of the file: a session file grows
+   *  to tens of MB and a drain takes it in batches of 50. It reads on until the batch
+   *  is full or the file ends, so lines that parse to nothing never stop a drain; one
+   *  line longer than the chunk gets a larger one, up to READ_MAX. */
   read(ref: OutboxRef, from: number, maxEvents = 500): { events: Event[]; offset: number } {
     const f = this.file(ref);
     if (!existsSync(f)) return { events: [], offset: from };
@@ -105,22 +112,31 @@ export class Outbox {
     if (from >= size) return { events: [], offset: from };
     const fd = openSync(f, "r");
     try {
-      const buf = Buffer.alloc(Math.min(size - from, 8 * 1024 * 1024));
-      const n = readSync(fd, buf, 0, buf.length, from);
-      const text = buf.subarray(0, n).toString("utf8");
       const events: Event[] = [];
       let offset = from;
-      let pos = 0;
-      while (events.length < maxEvents) {
-        const nl = text.indexOf("\n", pos);
-        if (nl < 0) break;
-        const line = text.slice(pos, nl);
-        pos = nl + 1;
-        offset = from + Buffer.byteLength(text.slice(0, pos), "utf8");
-        if (!line.trim()) continue;
-        try {
-          events.push(JSON.parse(line) as Event);
-        } catch {}
+      let chunk = READ_CHUNK;
+      while (events.length < maxEvents && offset < size) {
+        const buf = Buffer.alloc(Math.min(size - offset, chunk));
+        const n = readSync(fd, buf, 0, buf.length, offset);
+        const text = buf.subarray(0, n).toString("utf8");
+        let pos = 0;
+        let used = 0;
+        while (events.length < maxEvents) {
+          const nl = text.indexOf("\n", pos);
+          if (nl < 0) break;
+          const line = text.slice(pos, nl);
+          pos = nl + 1;
+          used += Buffer.byteLength(line, "utf8") + 1;
+          if (!line.trim()) continue;
+          try {
+            events.push(JSON.parse(line) as Event);
+          } catch {}
+        }
+        offset += used;
+        if (used) continue;
+        // No whole line in this chunk: a line longer than it, or a write in progress.
+        if (offset + n >= size || chunk >= READ_MAX) break;
+        chunk *= 2;
       }
       return { events, offset };
     } finally {
@@ -184,13 +200,20 @@ export class Cursors {
   }
 }
 
-/** A lock per session so two workers never interleave. Stale after 5 min. */
+/** A lock per session so two workers never interleave. Stale once the worker that
+ *  took it is gone (its 15 s deadline ends it without a release), or after 5 min. */
 export function takeLock(root: string, ref: OutboxRef, staleMs = 5 * 60_000): (() => void) | null {
+  return takeNamedLock(root, `${safeId(ref.harness)}-${safeId(ref.session)}`, staleMs);
+}
+
+/** A named lock under <root>/locks, held by one process at a time: the file names
+ *  its pid. Stale once that process is gone, or after `staleMs`. */
+export function takeNamedLock(root: string, name: string, staleMs = 5 * 60_000): (() => void) | null {
   const dir = path.join(root, "locks");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const f = path.join(dir, `${safeId(ref.harness)}-${safeId(ref.session)}.lock`);
+  const f = path.join(dir, `${name}.lock`);
   try {
-    if (Date.now() - statSync(f).mtimeMs > staleMs) unlinkSync(f);
+    if (Date.now() - statSync(f).mtimeMs > staleMs || !processAlive(Number(readFileSync(f, "utf8")))) unlinkSync(f);
     else return null;
   } catch {}
   try {
@@ -203,4 +226,16 @@ export function takeLock(root: string, ref: OutboxRef, staleMs = 5 * 60_000): ((
       unlinkSync(f);
     } catch {}
   };
+}
+
+/** Whether the process a lock or a claimed job names is still running. A pid that
+ *  can't be read counts as running: the age rule decides then. */
+export function processAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
 }

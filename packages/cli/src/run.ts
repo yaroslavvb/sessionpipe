@@ -16,6 +16,8 @@ import path from "node:path";
 import {
   adapterByName,
   Cursors,
+  capTail,
+  type DeliveryResult,
   type Event,
   type FactsState,
   FileSink,
@@ -24,6 +26,7 @@ import {
   machineName,
   makeEvent,
   Outbox,
+  processAlive,
   readConfig,
   redactDeep,
   type Session,
@@ -31,8 +34,11 @@ import {
   type SinkConfig,
   StdoutSink,
   safeId,
+  shortId,
   stateDir,
+  type TranscriptRead,
   takeLock,
+  takeNamedLock,
   tilde,
   writeConfig,
 } from "@sessionpipe/core";
@@ -75,7 +81,12 @@ export interface Job {
   env: Record<string, string>;
   ppid?: number;
   at: number;
+  /** How many times the session's lock held this job out (a fresh worker starts for
+   *  it each time, up to MAX_TRIES; after that a sweep picks it up). */
+  tries?: number;
 }
+
+export const MAX_TRIES = 10;
 
 /** A job file the worker will pick up: random suffix, 0600, in a 0700 dir. */
 export function enqueueJob(state: string, job: Job): string {
@@ -86,30 +97,70 @@ export function enqueueJob(state: string, job: Job): string {
   return f;
 }
 
-/** Jobs another worker left behind (a lost lock race, a killed worker): every
- *  worker sweeps the ones older than `olderThanMs` before it exits, so no event
- *  is lost (ground rule 4). Each is removed before it runs, so two sweepers
- *  never run one twice. */
-export async function sweepJobs(state: string, olderThanMs = 3000, limit = 20): Promise<number> {
+/** A job is claimed by renaming its file `<file>.<pid>.running`: of two workers that
+ *  race for it, one rename wins. The claim stays until the job's events are in the
+ *  outbox (or it went back to the queue), so a worker its deadline ended mid-run
+ *  leaves it behind for a sweep to give back (ground rule 4: no event lost). */
+export function claimJob(file: string): { job: Job; file: string } | null {
+  const claimed = `${file}.${process.pid}.running`;
+  try {
+    renameSync(file, claimed);
+  } catch {
+    return null;
+  }
+  try {
+    return { job: JSON.parse(readFileSync(claimed, "utf8")) as Job, file: claimed };
+  } catch {
+    releaseJob(claimed);
+    return null;
+  }
+}
+export function releaseJob(claimed: string | undefined): void {
+  if (!claimed) return;
+  try {
+    unlinkSync(claimed);
+  } catch {}
+}
+
+/** Jobs another worker left behind: a claim whose worker is gone (or older than any
+ *  worker lives, `abandonedMs`) goes back to the queue, then every queued job older
+ *  than `olderThanMs` (younger ones belong to the worker their hook just spawned)
+ *  is claimed and run. Every worker sweeps before it exits. */
+export async function sweepJobs(state: string, olderThanMs = 3000, limit = 20, abandonedMs = 60_000): Promise<number> {
   const jobs = jobsDir(state);
   let names: string[] = [];
   try {
-    names = readdirSync(jobs).filter((n) => n.endsWith(".json"));
+    names = readdirSync(jobs);
   } catch {
     return 0;
   }
-  let ran = 0;
-  for (const n of names.sort().slice(0, limit)) {
+  const queued = names.filter((n) => n.endsWith(".json"));
+  for (const n of names) {
+    const m = /^(.*\.json)\.(\d+)\.running$/.exec(n);
+    if (!m) continue;
     const f = path.join(jobs, n);
-    let job: Job | null = null;
+    try {
+      if (processAlive(Number(m[2])) && Date.now() - statSync(f).mtimeMs < abandonedMs) continue;
+      renameSync(f, path.join(jobs, m[1] as string));
+      queued.push(m[1] as string);
+    } catch {}
+  }
+  let ran = 0;
+  for (const n of queued.sort().slice(0, limit)) {
+    const f = path.join(jobs, n);
     try {
       if (Date.now() - statSync(f).mtimeMs < olderThanMs) continue;
-      job = JSON.parse(readFileSync(f, "utf8")) as Job;
-      unlinkSync(f);
     } catch {
       continue;
     }
-    await runJob(job, { state }).catch(() => {});
+    const c = claimJob(f);
+    if (!c) continue;
+    try {
+      await runJob(c.job, { state, claimed: c.file });
+    } catch {
+    } finally {
+      releaseJob(c.file);
+    }
     ran++;
   }
   return ran;
@@ -167,11 +218,46 @@ export function buildSinks(sinks: SinkConfig[], o: { locked?: (name: string) => 
   return out;
 }
 
-/** Run one hook job end to end: events → outbox → sinks. Returns what happened. */
+/** How often a running turn's words go out again (turn.progress), at most. */
+export const PROGRESS_MS = 20_000;
+
+/** The turn still running in a transcript read from the delivery cursor: the last
+ *  turn with a reply so far, or a prompt nothing has answered yet (the hook's own
+ *  copy when the transcript doesn't hold it yet). `base` is the number the cursor's
+ *  first turn will get, so a turn keeps the number its turn.transcript will carry.
+ *  The reply keeps its end when it is long: where the turn is now. */
+export function openTurn(
+  read: TranscriptRead,
+  o: { base: number; prompt?: string | undefined; at: number },
+): { turn: number; user: string; assistant: string; at: number } | null {
+  const last = read.turns[read.turns.length - 1];
+  const fresh = (user: string, at: number) => ({
+    turn: o.base + read.turns.length,
+    user: user.slice(0, MAX_TURN_SIDE),
+    assistant: "",
+    at,
+  });
+  if (read.open) return fresh(read.open.user, read.open.at);
+  // The prompt the hook just reported, unless the transcript already has its reply.
+  const prompt = o.prompt?.trim();
+  if (prompt && !(last && last.user.includes(prompt.slice(0, 200)))) return fresh(prompt, o.at);
+  if (!last) return null;
+  return {
+    turn: o.base + read.turns.length - 1,
+    user: last.user.slice(0, MAX_TURN_SIDE),
+    assistant: capTail(last.assistant, MAX_TURN_SIDE),
+    at: last.at,
+  };
+}
+const MAX_TURN_SIDE = 20_000;
+
+/** Run one hook job end to end: events → outbox → sinks. Returns what happened.
+ *  `claimed` is the job file this run holds: released once the events are in the
+ *  outbox or the job is back in the queue (`requeued` names its new file). */
 export async function runJob(
   job: Job,
-  opts: { state?: string; now?: number } = {},
-): Promise<{ events: Event[]; delivered: Record<string, number> }> {
+  opts: { state?: string; now?: number; claimed?: string; lockWaitMs?: number } = {},
+): Promise<{ events: Event[]; delivered: Record<string, number>; requeued?: string }> {
   const state = opts.state ?? stateDir();
   const cfg = readConfig();
   const adapter = adapterByName(job.harness);
@@ -203,18 +289,22 @@ export async function runJob(
   await tellDaemon(state, job, id, r.session.cwd, r.transcript);
   const outbox = new Outbox(state);
   const ref = { harness: job.harness, session: id };
-  // Hooks of one session fire close together (parallel subagents, issue #9): wait
-  // for the lock with a short backoff before giving the job back to the queue.
+  // Hooks of one session fire close together (parallel subagents, issue #9): poll
+  // for the lock, often enough that its siblings can't keep taking it in between,
+  // before giving the job back to the queue.
   let release = takeLock(state, ref);
-  for (let wait = 50; !release && wait <= 3200; wait *= 2) {
-    await new Promise((res) => setTimeout(res, wait));
+  const lockWait = opts.lockWaitMs ?? LOCK_WAIT_MS;
+  for (const until = Date.now() + lockWait; !release && Date.now() < until; ) {
+    await new Promise((res) => setTimeout(res, 50));
     release = takeLock(state, ref);
   }
   if (!release) {
-    log(state, `${job.harness} ${job.event}: session ${id} locked for 6 s, re-queued`);
-    enqueueJob(state, job);
-    return { events: [], delivered: {} };
+    log(state, `${job.harness} ${job.event}: session ${id} locked for ${lockWait / 1000} s, re-queued`);
+    const requeued = enqueueJob(state, { ...job, tries: (job.tries ?? 0) + 1 });
+    releaseJob(opts.claimed);
+    return { events: [], delivered: {}, requeued };
   }
+  const events: Event[] = [];
   try {
     const facts = factsState(state);
     const mem = facts.get(job.harness, id);
@@ -251,7 +341,6 @@ export async function runJob(
       ...(r.session.model ? { model: r.session.model } : {}),
     };
     const version = (facts.get(job.harness, id).harness_version as string | undefined) ?? undefined;
-    const events: Event[] = [];
     for (const a of r.events) {
       const e = makeEvent(a, {
         harness: { name: job.harness, ...(version ? { version } : {}) },
@@ -260,8 +349,39 @@ export async function runJob(
       });
       events.push(e);
     }
-    // Tier 2: after a turn ends, the transcript's new turns become turn.transcript events.
     const wantsTranscript = cfg.sinks.some((s) => !s.paused && Math.min(s.tier, s.max_tier ?? 3) >= 2);
+    // Tier 2, while a turn runs: what it has said so far, so a receiver can show a long
+    // turn before it ends. On the prompt, then at most every PROGRESS_MS on a tool call,
+    // and only when it changed. The cursor stays where it is: turn.transcript still
+    // delivers the whole turn when it ends.
+    const ending = r.events.some((e) => e.type === "turn.ended" || e.type === "session.ended");
+    const starting = r.events.some((e) => e.type === "turn.started");
+    if (wantsTranscript && r.transcript && !ending && (starting || r.events.some((e) => e.type === "tool.ended"))) {
+      const cur = facts.get(job.harness, id);
+      const at = opts.now ?? job.at;
+      if (starting || at - (Number(cur.progress_at) || 0) >= PROGRESS_MS) {
+        const p = openTurn(adapter.readTranscript(r.transcript, Number(cur.transcript_line) || 0), {
+          base: Number(cur.transcript_turns) || 0,
+          prompt: typeof r.hints?.prompt === "string" ? r.hints.prompt : undefined,
+          at,
+        });
+        const sig = p && `${p.turn}:${p.user.length}:${p.assistant.length}`;
+        if (p && (starting || sig !== cur.progress_sig)) {
+          events.push(
+            makeEvent(
+              { type: "turn.progress", harnessEvent: job.event, data: { ...p, at: new Date(p.at).toISOString() } },
+              {
+                harness: { name: job.harness, ...(version ? { version } : {}) },
+                session: { ...session, seq: outbox.nextSeq(ref) },
+                now: at,
+              },
+            ),
+          );
+          facts.save(job.harness, id, { progress_at: at, progress_sig: sig });
+        }
+      }
+    }
+    // Tier 2: after a turn ends, the transcript's new turns become turn.transcript events.
     if (
       wantsTranscript &&
       r.transcript &&
@@ -296,18 +416,105 @@ export async function runJob(
       ref,
       events.map((e) => ({ ...e, session: redactDeep(e.session), data: redactDeep(e.data) })),
     );
-    log(state, `${job.harness} ${job.event}: ${events.map((e) => e.type).join(",") || "nothing"} (${id.slice(0, 8)})`);
-    const delivered = await flush(state, cfg.sinks, outbox, ref);
-    if (Math.random() < 0.02) outbox.prune(cfg.keep_days ?? 30);
-    return { events, delivered };
+    releaseJob(opts.claimed);
+    log(
+      state,
+      `${job.harness} ${job.event}: ${events.map((e) => e.type).join(",") || "nothing"} (${shortId(job.harness, id)})`,
+    );
   } finally {
     release();
   }
+  // The session's lock covered the append; the sinks drain without it (the outbox
+  // reader leaves a line still being written), so a sibling hook isn't held out for
+  // a round trip.
+  const delivered = (await drain(state, cfg.sinks, outbox, ref)) ?? {};
+  if (Math.random() < 0.02) outbox.prune(cfg.keep_days ?? 30);
+  return { events, delivered };
 }
 
 /** Harnesses whose own files do not name the session's folder: the hooks' cwd is kept. */
 const CWD_FROM_HOOKS = new Set(["antigravity", "devin"]);
 
+/** One worker drains a machine's sinks at a time (the `flush` lock). Another whose
+ *  events are in the outbox meanwhile marks that there is more and leaves them to
+ *  it (null: nothing sent by this one). The one draining looks for the mark after
+ *  each pass, once it has let the lock go, so events appended during a pass go out
+ *  in its next pass or with the worker that appended them, never wait for a later
+ *  hook. Under a flood of hook events this is one uploader sending full batches,
+ *  not one per event, all refused together (mordast, 2026-10-14: 828 refusals in
+ *  two minutes, 5 192 jobs queued). */
+export async function drain(
+  state: string,
+  sinkConfigs: SinkConfig[],
+  outbox: Outbox,
+  first?: { harness: string; session: string },
+): Promise<Record<string, number> | null> {
+  const more = path.join(state, "locks", "flush.more");
+  let release = takeNamedLock(state, "flush");
+  if (!release) {
+    try {
+      writeFileSync(more, "", { mode: 0o600 });
+    } catch {}
+    release = takeNamedLock(state, "flush");
+    if (!release) return null;
+  }
+  const delivered: Record<string, number> = {};
+  for (;;) {
+    try {
+      unlinkSync(more);
+    } catch {}
+    try {
+      for (const [k, v] of Object.entries(await flush(state, sinkConfigs, outbox, first)))
+        delivered[k] = (delivered[k] ?? 0) + v;
+    } finally {
+      release();
+    }
+    if (!existsSync(more)) return delivered;
+    release = takeNamedLock(state, "flush");
+    if (!release) return delivered;
+  }
+}
+
+/** HTTP.md §2: a sink that answered 429 isn't tried again before its `retry-after`;
+ *  one that was unreachable (5xx, a timeout) waits 2 s · 10 s · 60 s · 5 min · 30 min,
+ *  then every 30 min. Kept in <state>/backoff/<sink>.json, so every worker on the
+ *  machine waits, not only the one that was refused. Cleared by the next batch the
+ *  sink takes. */
+export interface Backoff {
+  until: number;
+  failures: number;
+  why: string;
+}
+const BACKOFF_MS = [2_000, 10_000, 60_000, 5 * 60_000, 30 * 60_000];
+const backoffFile = (state: string, sink: string): string => path.join(state, "backoff", `${safeId(sink)}.json`);
+export function readBackoff(state: string, sink: string): Backoff | null {
+  try {
+    const b = JSON.parse(readFileSync(backoffFile(state, sink), "utf8")) as Backoff;
+    return typeof b.until === "number" ? b : null;
+  } catch {
+    return null;
+  }
+}
+function noteFailure(state: string, sink: string, res: DeliveryResult, prev: Backoff | null): Backoff {
+  const failures = (prev?.failures ?? 0) + 1;
+  const ladder = BACKOFF_MS[Math.min(failures, BACKOFF_MS.length) - 1] as number;
+  const wait = Number.isFinite(res.retryAfterMs) ? (res.retryAfterMs as number) : ladder;
+  const b = { until: Date.now() + wait, failures, why: `${res.status ?? ""} ${res.error ?? ""}`.trim() };
+  const f = backoffFile(state, sink);
+  try {
+    mkdirSync(path.dirname(f), { recursive: true, mode: 0o700 });
+    writeFileSync(f, JSON.stringify(b), { mode: 0o600 });
+  } catch {}
+  return b;
+}
+function clearBackoff(state: string, sink: string): void {
+  try {
+    unlinkSync(backoffFile(state, sink));
+  } catch {}
+}
+
+/** How long a job waits for its session's lock before it goes back to the queue. */
+const LOCK_WAIT_MS = 6000;
 const BATCH = 50;
 const MAX_PER_RUN = 500;
 
@@ -316,12 +523,15 @@ const MAX_PER_RUN = 500;
  *  install's 400-session backfill is nine POSTs, not four hundred (the receiver's
  *  write limit ended the first replay at 278 events, 2026-09-28). A cursor moves
  *  only after its batch was acknowledged; a refused batch stops the sink for this
- *  run and the next worker starts from the same cursors. */
+ *  run and the next worker starts from the same cursors. The sinks drain at once:
+ *  the session's lock is held for the slowest round trip, not the sum of them (a
+ *  verdict's config write is synchronous, so two sinks' never interleave). */
 export async function flush(
   state: string,
   sinkConfigs: SinkConfig[],
   outbox: Outbox,
   first?: { harness: string; session: string },
+  o: { /** Try a sink in backoff anyway (`sessionpipe replay`). */ force?: boolean } = {},
 ): Promise<Record<string, number>> {
   const delivered: Record<string, number> = {};
   const sinks = buildSinks(sinkConfigs, {
@@ -332,7 +542,12 @@ export async function flush(
     const k = `${first.harness}/${safeId(first.session)}`;
     refs.sort((a, b) => (`${a.harness}/${a.session}` === k ? -1 : `${b.harness}/${b.session}` === k ? 1 : 0));
   }
-  for (const sink of sinks) {
+  const drainSink = async (sink: Sink): Promise<void> => {
+    let backoff = readBackoff(state, sink.name);
+    if (backoff && !o.force && backoff.until > Date.now()) {
+      delivered[sink.name] = 0;
+      return;
+    }
     const cursors = new Cursors(state, sink.name);
     const c = cursors.read();
     let sent = 0;
@@ -350,13 +565,22 @@ export async function flush(
       }
       const res = await sink.send(batch);
       if (!res.ok) {
-        log(state, `sink ${sink.name}: ${res.status ?? ""} ${res.error ?? ""} → ${res.action ?? "retry"}`);
+        const action = res.action ?? "retry";
+        let wait = "";
+        if (action === "retry") {
+          backoff = noteFailure(state, sink.name, res, backoff);
+          wait = `, waits ${Math.round((backoff.until - Date.now()) / 1000)} s`;
+        }
+        log(state, `sink ${sink.name}: ${res.status ?? ""} ${res.error ?? ""} → ${action}${wait}`);
         if (res.action === "pause" || res.action === "lower-tier") applySinkVerdict(sink.name, res);
         if (res.action !== "drop") {
           batch = [];
           pending = {};
           return false;
         }
+      } else if (backoff) {
+        clearBackoff(state, sink.name);
+        backoff = null;
       }
       sent += batch.length;
       Object.assign(c, pending);
@@ -389,7 +613,8 @@ export async function flush(
     }
     if (!stalled && (batch.length || Object.keys(pending).length)) if (!(await send())) stalled = true;
     delivered[sink.name] = sent;
-  }
+  };
+  await Promise.all(sinks.map(drainSink));
   return delivered;
 }
 

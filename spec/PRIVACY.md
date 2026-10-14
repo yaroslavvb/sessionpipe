@@ -12,7 +12,7 @@ a sink gets a tier, the tier is an allowlist, and two rulesets scrub what remain
 |-----:|------|---------|
 | 0 | presence | Session id, state events (`session.*`, `turn.started`, `turn.ended`, `attention.*` with only `attention_id` and `kind`), timing, machine, cwd, repo, branch, model, title, url, account_id. Enough for "working / needs you / done" and a link to open the session. |
 | 1 | actions | + tool names, `call_id`, durations, ok/error text, `files.changed` paths, attention `tool` and `message` (redacted, ≤ 200 chars), `prompt_chars`, subagents, compactions. Enough for an activity feed. |
-| 2 | conversation | + `turn.transcript`: the person's prompts and the assistant's text, redacted, ≤ 20 000 chars a side. Enough for memory, search, recaps. |
+| 2 | conversation | + `turn.transcript`: the person's prompts and the assistant's text, redacted, ≤ 20 000 chars a side, and `turn.progress`, the same for a turn still running. Enough for memory, search, recaps. |
 | 3 | full | + tool `input` and `output` (≤ 64 KB each), thinking where the harness exposes it, the native lane's raw lines. Full replay; meant for a receiver you own. |
 
 Rules:
@@ -70,6 +70,12 @@ anonymity:
 | `session.account_id` | dropped |
 
 Vectors: `conformance/redaction/pii.json`.
+
+Tiers and rulesets govern events. The control lane is not a sink: it talks only to a
+receiver the person paired with by approving it with their passkey, and its pairing
+request and hellos may name the machine's harness accounts with their emails
+(`accounts`, [CONTROL.md §2](CONTROL.md#2-keys-and-enrollment)) so that receiver's board can label
+`session.account_id`. No event carries an email for that.
 
 ## 3. What a sender never reads
 

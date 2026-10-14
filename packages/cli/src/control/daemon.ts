@@ -13,9 +13,11 @@ import net from "node:net";
 import path from "node:path";
 import {
   antigravityControl,
+  claudeAccounts,
   claudeControl,
   codexControl,
   deniedNote,
+  type HarnessAccount,
   JOB_TIMEOUT_MS,
   jobEnv,
   type Login,
@@ -24,6 +26,7 @@ import {
   type RunResult,
   redactSecrets,
   safeId,
+  shortId,
 } from "@sessionpipe/core";
 import { type ControlCommand, parseSessionRef, verifyCommand } from "@sessionpipe/core/control";
 import { type Alias, type Aliases, aliasFile, readAliases, receiverIdOf, writeAliases } from "./aliases.js";
@@ -159,6 +162,9 @@ export interface DaemonDeps {
   /** The harnesses every hello advertises (core's drivableHarnesses); by default, the
    *  ones the finders above find. */
   harnesses?: () => string[];
+  /** The harness accounts every hello names; by default, those signed in across
+   *  `claudeDirs`, read again for each hello. */
+  accounts?: () => HarnessAccount[];
   run: (bin: string, args: string[], o: RunOptions) => Promise<RunResult>;
   sdk?: SdkHost | null;
   /** How long to follow a live session's turn for an in-place answer (tests shorten it). */
@@ -766,6 +772,7 @@ export class ControlDaemon {
     const waiting = [...this.live].filter(([, l]) => l.waiter).map(([k]) => k);
     const modes: DeliveryMode[] = ["waiter", "turn", "resume", "fork", ...(this.deps.sdk ? (["sdk"] as const) : [])];
     const harnesses = this.harnesses();
+    const accounts = this.accounts();
     for (const r of this.cfg.receivers) {
       const body = {
         name: this.cfg.name,
@@ -776,6 +783,7 @@ export class ControlDaemon {
         waiting,
         folders: this.cfg.folders,
         mode: this.cfg.mode,
+        ...(accounts.length ? { accounts } : {}),
       };
       await this.post(r, "/hello", body).catch(() => {});
     }
@@ -939,7 +947,8 @@ export class ControlDaemon {
     if (ref.harness === "claude-code") {
       const target = this.state.copies[ref.id] ?? ref.id;
       const t = findTranscript(target, this.deps.claudeDirs()) ?? findTranscript(ref.id, this.deps.claudeDirs());
-      if (!t) return { refused: "no_session", why: `no Claude Code session ${ref.id.slice(0, 8)} on this machine` };
+      if (!t)
+        return { refused: "no_session", why: `no Claude Code session ${shortId(ref.harness, ref.id)} on this machine` };
       const folder = sessionFolder(t);
       const ok = folder && this.allowed(folder);
       if (!ok) return { refused: "folder", why: "that session's folder isn't one this machine allows" };
@@ -964,13 +973,14 @@ export class ControlDaemon {
     let file: string | null = null;
     if (ref.harness === "codex") {
       file = isUuid(target) ? codexControl.findRollout(target, this.deps.env ?? process.env) : null;
-      if (!a && !file) return { refused: "no_session", why: `no Codex session ${ref.id.slice(0, 8)} on this machine` };
+      if (!a && !file)
+        return { refused: "no_session", why: `no Codex session ${shortId(ref.harness, ref.id)} on this machine` };
       cwd ||= file ? codexControl.codexFacts(file).cwd : undefined;
     } else cwd ||= this.live.get(session)?.cwd || this.factsCwd(ref.harness, ref.id);
     if (!cwd)
       return {
         refused: "no_session",
-        why: `no folder known for ${ref.harness === "codex" ? "Codex" : "Antigravity"} session ${ref.id.slice(0, 8)}`,
+        why: `no folder known for ${ref.harness === "codex" ? "Codex" : "Antigravity"} session ${shortId(ref.harness, ref.id)}`,
       };
     const ok = this.allowed(cwd);
     if (!ok) return { refused: "folder", why: "that session's folder isn't one this machine allows" };
@@ -1039,6 +1049,15 @@ export class ControlDaemon {
         reading: () => antigravityControl.reading(),
       };
     return null;
+  }
+
+  /** Who is signed in here, for hello. A bad .claude.json names nobody, never fails a hello. */
+  private accounts(): HarnessAccount[] {
+    try {
+      return this.deps.accounts ? this.deps.accounts() : claudeAccounts(this.deps.claudeDirs());
+    } catch {
+      return [];
+    }
   }
 
   /** The harnesses this machine can run a message in, for hello. */
@@ -1663,7 +1682,9 @@ export class ControlDaemon {
     if ("failed" in ready) return this.finish(r, id, { outcome: "failed", detail: ready.failed });
     this.finish(r, id, { outcome: "taken" });
     const args = drv.args({ mode: this.cfg.mode, prompt: frameStart(cmd.text as string, r.url), cwd });
-    this.deps.log(`${id.slice(-8)}: ${drv.cmd} new session for ${ref.id.slice(0, 8)} (${this.cfg.mode}) in ${cwd}`);
+    this.deps.log(
+      `${id.slice(-8)}: ${drv.cmd} new session for ${shortId(ref.harness, ref.id)} (${this.cfg.mode}) in ${cwd}`,
+    );
     await this.drive(r, id, ref, drv, ready.bin, args, cwd, sent, null);
   }
 

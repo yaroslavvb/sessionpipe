@@ -80,8 +80,19 @@ blanks an earlier full value.
 | `model` | The model id the harness reports. |
 | `title`, `title_source` | The session's name and where it came from: `custom` (the person named it), `harness` (the tool's own titler), `first-ask` (the first prompt, cut). A receiver SHOULD never replace a better source with a worse one. |
 | `url` | A link that opens the session (a Remote Control link, a web remote). |
-| `account_id` | An opaque id for the harness account, never an email. |
+| `account_id` | An opaque id for the harness account, never an email. A receiver the person paired with for control learns the email that goes with it from the pairing request and the daemon's hellos (`accounts`, [CONTROL.md §2](CONTROL.md#2-keys-and-enrollment)). |
 | `parent_id` | For a subagent's own events: the parent session's id. `null` or absent otherwise. |
+
+**Short id.** Where a session is named to a person (a log line, a notification, a
+search box), senders and receivers use its short id: the first 8 hex digits, lowercase,
+of `sha256("sessionpipe.session:" + harness.name + ":" + session.id)`. It is derived
+from fields every event carries and is never sent. The id's own prefix is not a short
+form: Codex ids are time-ordered (UUIDv7), so two sessions started in the same minute
+share their first eight characters. A receiver SHOULD accept a typed prefix of a short
+id and resolve it against its sessions newest first, and MUST list the candidates
+rather than pick one when more than one matches. Vectors: `claude-code` with
+`8c132906-8c3f-4814-870a-afc3d05e1d2e` → `58ab6602`; `codex` with
+`01a10860-a43f-7ce2-b12f-a7911ae8a880` → `ae08c6ab`.
 
 ## 4. Event vocabulary
 
@@ -99,6 +110,7 @@ Per-type `data` shapes are normative in
 | `turn.started` | 0 | `turn_id?`; tier 1 adds `prompt_chars` | A prompt was submitted. |
 | `turn.ended` | 0 | `turn_id?`, `reason`: `stop` · `interrupt` · `error`, `ms?`; tier 1 adds `error` (the harness's error class when the reason is `error`) | The Stop / AfterAgent / agentStop hook; Claude Code's `StopFailure` (a turn that ended on an API error) with `reason: error`. |
 | `turn.transcript` | 2 | `turn` (integer), `user`, `assistant` (each ≤ 20 000 chars, redacted), `at` | Read from the harness's transcript file by the worker after a turn ends; one event per completed exchange, in order. |
+| `turn.progress` | 2 | `turn` (integer), `user`, `assistant` (each ≤ 20 000 chars, redacted; over the cap the `assistant` side keeps its **end**), `at` | The turn still running: its prompt as the turn starts, then what the assistant has said so far, at most every 20 s on a tool call and only when it changed. `turn` is the number its `turn.transcript` will carry. A receiver keeps the latest per session and drops it once that `turn.transcript` (or the turn's end) arrives; it is a reading, never history. OPTIONAL for senders. |
 | `tool.started` | 1 | `tool`, `call_id?`, `turn_id?`, `agent_id?` (set when a subagent made the call); tier 3 adds `input` | Pre-tool hook. OPTIONAL for senders whose harness has none. |
 | `tool.ended` | 1 | `tool`, `call_id?`, `turn_id?`, `agent_id?`, `ms?`, `ok`, `error?`; tier 3 adds `input`, `output` (each ≤ 64 KB) | Post-tool hook. A tool name is `[A-Za-z0-9_.:-]{1,120}`; MCP tools keep the harness's own spelling. |
 | `files.changed` | 1 | `paths[]` (repo-relative or `~`-relative) | File-edit hooks (Cursor, Kiro, Goose), or paths lifted from a write tool's input. |
@@ -132,7 +144,7 @@ What each tier carries. The full rules, the rulesets and guidance are in
 | Tool names, durations, ok/error | — | ✓ | ✓ | ✓ |
 | File paths touched | — | ✓ | ✓ | ✓ |
 | Attention message, prompt length, subagents, compactions | — | ✓ | ✓ | ✓ |
-| Prompts and assistant text (`turn.transcript`) | — | — | ✓ | ✓ |
+| Prompts and assistant text (`turn.transcript`, `turn.progress`) | — | — | ✓ | ✓ |
 | Tool input and output, thinking, raw lines | — | — | — | ✓ |
 | Secrets ruleset | n/a | always | always | always |
 | PII ruleset | opt-in | opt-in | opt-in | opt-in |
